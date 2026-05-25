@@ -20,6 +20,21 @@ def read_proc_meminfo():
     return info
 
 
+def effective_available_ram():
+    info = read_proc_meminfo()
+    host_avail = info["MemAvailable"]
+    for path in ["/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"]:
+        try:
+            val = open(path).read().strip()
+            if val != "max":
+                limit = int(val)
+                used = info["MemTotal"] - host_avail
+                return max(0, min(host_avail, limit - used))
+        except (FileNotFoundError, ValueError):
+            continue
+    return host_avail
+
+
 class MemoryMonitor:
     def __init__(self, interval=0.2):
         self.interval = interval
@@ -92,11 +107,19 @@ def main():
     print(f"Device: {device}")
     print(f"Total VRAM: {total_vram / 1024**3:.2f} GB")
 
-    target_bytes = int(total_vram * 1.5)
+    import os
+    threshold = int(os.environ.get("CUDA_SWAP_THRESHOLD_MB", 512)) * 1024 * 1024
+    host_avail = effective_available_ram()
+    host_safety = 2 * 1024 * 1024 * 1024
+    max_spill = max(0, host_avail - host_safety)
+    max_total = (total_vram - threshold) + max_spill
+    target_bytes = min(int(total_vram * 1.5), max_total)
+
     tensor_bytes = max(total_vram // 8, 256 * 1024 * 1024)
-    n = (target_bytes + tensor_bytes - 1) // tensor_bytes
+    n = max(1, (target_bytes + tensor_bytes - 1) // tensor_bytes)
     elements = tensor_bytes // 4  # float32
 
+    print(f"host_avail={host_avail/1024**3:.1f} GB  max_spill={max_spill/1024**3:.1f} GB")
     print(f"Allocating {n} arrays × {tensor_bytes / 1024**3:.2f} GB "
           f"= {n * tensor_bytes / 1024**3:.2f} GB total")
 

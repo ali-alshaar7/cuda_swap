@@ -15,14 +15,16 @@ using Fn_cuMemAllocManaged = CUresult(*)(CUdeviceptr*, size_t, unsigned int);
 using Fn_cuMemFree         = CUresult(*)(CUdeviceptr);
 using Fn_cuMemGetInfo      = CUresult(*)(size_t*, size_t*);
 using Fn_cuCtxGetDevice    = CUresult(*)(CUdevice*);
-using Fn_cuMemAdvise       = CUresult(*)(CUdeviceptr, size_t, CUmem_advise, CUdevice);
+using Fn_cuMemAdvise          = CUresult(*)(CUdeviceptr, size_t, CUmem_advise, CUdevice);
+using Fn_cuMemPrefetchAsync   = CUresult(*)(CUdeviceptr, size_t, int, CUstream);
 
-static Fn_cuMemAlloc        real_cuMemAlloc;
-static Fn_cuMemAllocManaged real_cuMemAllocManaged;
-static Fn_cuMemFree         real_cuMemFree;
-static Fn_cuMemGetInfo      real_cuMemGetInfo;
-static Fn_cuCtxGetDevice    real_cuCtxGetDevice;
-static Fn_cuMemAdvise       real_cuMemAdvise;
+static Fn_cuMemAlloc          real_cuMemAlloc;
+static Fn_cuMemAllocManaged   real_cuMemAllocManaged;
+static Fn_cuMemFree           real_cuMemFree;
+static Fn_cuMemGetInfo        real_cuMemGetInfo;
+static Fn_cuCtxGetDevice      real_cuCtxGetDevice;
+static Fn_cuMemAdvise         real_cuMemAdvise;
+static Fn_cuMemPrefetchAsync  real_cuMemPrefetchAsync;
 
 static std::once_flag g_init_flag;
 
@@ -52,7 +54,8 @@ static void do_resolve() {
     real_cuMemFree         = (Fn_cuMemFree)         R("cuMemFree_v2");
     real_cuMemGetInfo      = (Fn_cuMemGetInfo)      R("cuMemGetInfo_v2");
     real_cuCtxGetDevice    = (Fn_cuCtxGetDevice)    R("cuCtxGetDevice");
-    real_cuMemAdvise       = (Fn_cuMemAdvise)       R("cuMemAdvise");
+    real_cuMemAdvise         = (Fn_cuMemAdvise)        R("cuMemAdvise");
+    real_cuMemPrefetchAsync  = (Fn_cuMemPrefetchAsync) R("cuMemPrefetchAsync");
 
     size_t ram_total = 0, ram_avail = 0;
     read_meminfo(&ram_total, &ram_avail);
@@ -64,8 +67,6 @@ static void do_resolve() {
             ram_avail/(1024*1024),
             log_level());
 }
-
-static void ensure_init() { std::call_once(g_init_flag, do_resolve); }
 
 bool vmm_supported() { return real_cuMemAlloc && real_cuMemAllocManaged; }
 
@@ -80,7 +81,10 @@ struct AllocEntry {
 
 static std::mutex g_mutex;
 static std::unordered_map<CUdeviceptr, AllocEntry> g_allocs;
-static size_t g_managed_bytes = 0;  // sum of live managed allocation sizes
+
+static void ensure_init() {
+    std::call_once(g_init_flag, do_resolve);
+}
 
 
 static size_t free_vram() {
@@ -154,7 +158,6 @@ CUresult vmm_alloc(CUdeviceptr* out, size_t size) {
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         g_allocs[*out] = {size, use_managed};
-        if (use_managed) g_managed_bytes += size;
     }
 
     return CUDA_SUCCESS;
@@ -173,7 +176,6 @@ CUresult vmm_free(CUdeviceptr ptr) {
         if (it == g_allocs.end()) return CUDA_ERROR_INVALID_VALUE;
         entry = it->second;
         g_allocs.erase(it);
-        if (entry.managed) g_managed_bytes -= entry.size;
     }
 
     if (real_cuMemFree) real_cuMemFree(ptr);

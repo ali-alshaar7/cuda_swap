@@ -6,6 +6,7 @@ Without cuda_swap: dies with CUDA out of memory.
 With cuda_swap preloaded: completes successfully (slowly, due to host swapping).
 """
 
+import os
 import sys
 import threading
 import time
@@ -19,6 +20,25 @@ def read_proc_meminfo():
             k, v = line.split(":")
             info[k.strip()] = int(v.split()[0]) * 1024  # kB -> bytes
     return info
+
+
+def effective_available_ram():
+    """Returns available RAM respecting Docker/cgroup memory limits."""
+    info = read_proc_meminfo()
+    host_avail = info["MemAvailable"]
+
+    # cgroup v2
+    for path in ["/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"]:
+        try:
+            val = open(path).read().strip()
+            if val != "max":
+                limit = int(val)
+                used = info["MemTotal"] - host_avail
+                return max(0, min(host_avail, limit - used))
+        except (FileNotFoundError, ValueError):
+            continue
+
+    return host_avail
 
 
 class MemoryMonitor:
@@ -72,14 +92,20 @@ def main():
     print(f"Device: {props.name}")
     print(f"Total VRAM: {total_vram / 1024**3:.2f} GB")
 
-    # Target 2x VRAM.
-    target_bytes = int(total_vram * 2.0)
-    # Each tensor is 1/8 of VRAM so we get ~12 tensors; small enough to
-    # allocate one at a time but numerous enough to stress the swapper.
+    # Target 2x VRAM, capped by what host RAM can actually absorb.
+    # Only allocations beyond (VRAM - threshold) spill to host RAM.
+    threshold = int(os.environ.get("CUDA_SWAP_THRESHOLD_MB", 512)) * 1024 * 1024
+    host_avail = effective_available_ram()
+    host_safety = 2 * 1024 * 1024 * 1024
+    max_spill = max(0, host_avail - host_safety)
+    max_total = (total_vram - threshold) + max_spill
+    target_bytes = min(int(total_vram * 2.0), max_total)
+
     tensor_bytes = max(total_vram // 8, 256 * 1024 * 1024)  # at least 256 MB
-    n = (target_bytes + tensor_bytes - 1) // tensor_bytes
+    n = max(1, (target_bytes + tensor_bytes - 1) // tensor_bytes)
     elements = tensor_bytes // 4  # float32
 
+    print(f"host_avail={host_avail/1024**3:.1f} GB  max_spill={max_spill/1024**3:.1f} GB")
     print(f"Allocating {n} tensors × {tensor_bytes / 1024**3:.2f} GB "
           f"= {n * tensor_bytes / 1024**3:.2f} GB total")
 

@@ -22,6 +22,21 @@ def read_proc_meminfo():
     return info
 
 
+def effective_available_ram():
+    info = read_proc_meminfo()
+    host_avail = info["MemAvailable"]
+    for path in ["/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"]:
+        try:
+            val = open(path).read().strip()
+            if val != "max":
+                limit = int(val)
+                used = info["MemTotal"] - host_avail
+                return max(0, min(host_avail, limit - used))
+        except (FileNotFoundError, ValueError):
+            continue
+    return host_avail
+
+
 class MemoryMonitor:
     def __init__(self, interval=0.1):
         self.interval = interval
@@ -72,11 +87,17 @@ def main():
     in_features  = 8192
     out_features = 8192
 
-    # Size batch so each activation tensor is ~2 GB individually (safe to allocate),
-    # but with 3 hidden layers alive simultaneously the peak exceeds VRAM.
-    # peak ≈ model(0.5 GB) + input(2 GB) + 3×hidden(2 GB each) = 8.5 GB > VRAM
-    tensor_target = 2 * gb  # 2 GB per activation tensor
-    batch_size = tensor_target // (out_features * 4)
+    # Each activation tensor targets ~2 GB so peak (model + 3 hidden layers) > VRAM.
+    # Cap so total spill fits in available host RAM.
+    import os
+    threshold = int(os.environ.get("CUDA_SWAP_THRESHOLD_MB", 512)) * 1024 * 1024
+    host_avail = effective_available_ram()
+    host_safety = 2 * gb
+    max_spill = max(0, host_avail - host_safety)
+    # Peak spill ≈ 3 activation tensors beyond VRAM threshold
+    max_tensor = min(2 * gb, (total_vram - threshold + max_spill) // 3)
+    batch_size = max(1, int(max_tensor) // (out_features * 4))
+    print(f"host_avail={host_avail/gb:.1f} GB  max_spill={max_spill/gb:.1f} GB")
 
     model = nn.Sequential(
         nn.Linear(in_features, out_features),
