@@ -62,4 +62,4 @@ Benchmarked on RTX 3070 Ti (8 GB VRAM, 16 GB RAM), 3 trials each, run in a Docke
 | train_spike.py (VRAM spike training) | OOM (all trials) | **289.9s ± 13.1s** |
 | alloc_oom_jax.py (1.5× VRAM JAX) | OOM (all trials) | **28.5s ± 0.9s** |
 
-The slowdown relative to a no-OOM baseline is the cost of hardware page faulting between GPU and host RAM — no explicit copy operations, no code changes required.
+The overhead comes from hardware page faulting between GPU and host RAM — no explicit copy operations, no code changes required.
