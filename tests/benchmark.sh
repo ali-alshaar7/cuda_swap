@@ -86,4 +86,9 @@ run_bench "with    cuda_swap" env XLA_PYTHON_CLIENT_ALLOCATOR=platform \
     LD_PRELOAD="$SO" "$PYTHON" "$SCRIPT_DIR/alloc_oom_jax.py"
 
 echo ""
+echo "--- multi_stream.py (concurrent streams, total > VRAM) ---"
+run_bench "without cuda_swap" "$PYTHON" "$SCRIPT_DIR/multi_stream.py"
+run_bench "with    cuda_swap" env LD_PRELOAD="$SO" "$PYTHON" "$SCRIPT_DIR/multi_stream.py"
+
+echo ""
 echo "Done."

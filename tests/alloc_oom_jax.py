@@ -1,79 +1,18 @@
 """
-Allocates ~2x the GPU's total VRAM in float32 JAX arrays, keeps them alive,
+Allocates ~1.5x the GPU's total VRAM in float32 JAX arrays, keeps them alive,
 sums them, and verifies the result.
 
-Without cuda_swap: dies with XlaRuntimeError / ResourceExhausted (VRAM OOM).
+Requires XLA_PYTHON_CLIENT_ALLOCATOR=platform so XLA calls cudaMalloc per
+tensor rather than pre-allocating a fixed slab.
+
+Without cuda_swap: dies with XlaRuntimeError / ResourceExhausted.
 With cuda_swap preloaded: completes successfully (slowly, due to host swapping).
 """
 
+import os
+import subprocess
 import sys
-import threading
-import time
-
-
-def read_proc_meminfo():
-    info = {}
-    with open("/proc/meminfo") as f:
-        for line in f:
-            k, v = line.split(":")
-            info[k.strip()] = int(v.split()[0]) * 1024  # kB -> bytes
-    return info
-
-
-def effective_available_ram():
-    info = read_proc_meminfo()
-    host_avail = info["MemAvailable"]
-    for path in ["/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"]:
-        try:
-            val = open(path).read().strip()
-            if val != "max":
-                limit = int(val)
-                used = info["MemTotal"] - host_avail
-                return max(0, min(host_avail, limit - used))
-        except (FileNotFoundError, ValueError):
-            continue
-    return host_avail
-
-
-class MemoryMonitor:
-    def __init__(self, interval=0.2):
-        self.interval = interval
-        self.peak_vram = 0
-        self.peak_ram_used = 0
-        self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._run, daemon=True)
-
-    def start(self):
-        baseline = read_proc_meminfo()
-        self._ram_total = baseline["MemTotal"]
-        self._thread.start()
-        return self
-
-    def stop(self):
-        self._stop.set()
-        self._thread.join()
-
-    def _run(self):
-        import jax
-        while not self._stop.is_set():
-            try:
-                d = jax.devices("gpu")[0]
-                vram = d.memory_stats().get("bytes_in_use", 0)
-                self.peak_vram = max(self.peak_vram, vram)
-
-                m = read_proc_meminfo()
-                used = m["MemTotal"] - m["MemAvailable"]
-                self.peak_ram_used = max(self.peak_ram_used, used)
-            except Exception:
-                pass
-            time.sleep(self.interval)
-
-    def report(self):
-        gb = 1024**3
-        print(f"\n--- Memory peak report ---")
-        print(f"  Peak VRAM (jax):     {self.peak_vram/gb:.2f} GB")
-        print(f"  Peak system RAM used:{self.peak_ram_used/gb:.2f} GB  "
-              f"(of {self._ram_total/gb:.1f} GB total)")
+from utils import available_ram, MemoryMonitor
 
 
 def main():
@@ -85,75 +24,65 @@ def main():
         print("ERROR: no GPU device found")
         sys.exit(2)
 
-    monitor = MemoryMonitor().start()
-
     device = devices[0]
+
+    def jax_vram():
+        try:
+            return device.memory_stats().get("bytes_in_use", 0)
+        except Exception:
+            return 0
+
+    monitor = MemoryMonitor(vram_fn=jax_vram).start()
+
     try:
-        import subprocess
         out = subprocess.check_output(
             ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
-            text=True
+            text=True,
         ).strip().splitlines()[0]
-        total_vram = int(out) * 1024 * 1024  # MiB -> bytes
+        total_vram = int(out) * 1024 * 1024
     except Exception:
-        try:
-            # bytes_limit may be inflated by cuda_swap's cuMemGetInfo hook;
-            # use it only as a last resort and halve it as a rough correction.
-            total_vram = device.memory_stats()["bytes_limit"] // 2
-        except Exception:
-            total_vram = 8 * 1024**3
-            print("Warning: could not query VRAM size, assuming 8 GB")
+        total_vram = device.memory_stats().get("bytes_limit", 8 * 1024**3) // 2
+        print("Warning: could not query VRAM via nvidia-smi, using estimate")
 
     print(f"Device: {device}")
     print(f"Total VRAM: {total_vram / 1024**3:.2f} GB")
 
-    import os
-    threshold = int(os.environ.get("CUDA_SWAP_THRESHOLD_MB", 512)) * 1024 * 1024
-    host_avail = effective_available_ram()
-    host_safety = 2 * 1024 * 1024 * 1024
-    max_spill = max(0, host_avail - host_safety)
-    max_total = (total_vram - threshold) + max_spill
-    target_bytes = min(int(total_vram * 1.5), max_total)
+    threshold  = int(os.environ.get("CUDA_SWAP_THRESHOLD_MB", 512)) * 1024 * 1024
+    host_avail = available_ram()
+    max_spill  = max(0, host_avail - 2 * 1024**3)
+    target     = min(int(total_vram * 1.5), (total_vram - threshold) + max_spill)
 
     tensor_bytes = max(total_vram // 8, 256 * 1024 * 1024)
-    n = max(1, (target_bytes + tensor_bytes - 1) // tensor_bytes)
-    elements = tensor_bytes // 4  # float32
+    n        = max(1, (target + tensor_bytes - 1) // tensor_bytes)
+    elements = tensor_bytes // 4
 
     print(f"host_avail={host_avail/1024**3:.1f} GB  max_spill={max_spill/1024**3:.1f} GB")
-    print(f"Allocating {n} arrays × {tensor_bytes / 1024**3:.2f} GB "
-          f"= {n * tensor_bytes / 1024**3:.2f} GB total")
+    print(f"Allocating {n} arrays × {tensor_bytes/1024**3:.2f} GB "
+          f"= {n*tensor_bytes/1024**3:.2f} GB total")
 
     arrays = []
     for i in range(n):
         a = jnp.ones(elements, dtype=jnp.float32)
         a.block_until_ready()
         arrays.append(a)
-        try:
-            vram_live = device.memory_stats().get("bytes_in_use", 0) / 1024**3
-        except Exception:
-            vram_live = float("nan")
-        print(f"  [{i+1:2d}/{n}] allocated, live_vram≈{vram_live:.2f} GB")
+        print(f"  [{i+1:2d}/{n}] live_vram≈{jax_vram()/1024**3:.2f} GB")
 
     print("\nAll arrays allocated. Running elementwise sum...")
-
     result = arrays[0]
     for a in arrays[1:]:
         result = result + a
-
     result.block_until_ready()
 
+    got      = float(jnp.mean(result))
     expected = float(n)
-    got = float(jnp.mean(result))
     print(f"\nResult mean = {got:.1f}  (expected {expected:.1f})")
 
+    monitor.stop()
+    monitor.report(vram_label="jax")
+
     if abs(got - expected) > 0.5:
-        monitor.stop()
-        monitor.report()
         print("FAIL: math result is wrong!")
         sys.exit(1)
-
-    monitor.stop()
-    monitor.report()
     print("SUCCESS")
 
 

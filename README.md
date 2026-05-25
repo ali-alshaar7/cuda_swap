@@ -52,6 +52,11 @@ LD_PRELOAD=build/cuda_swap.so python tests/train_spike.py
 XLA_PYTHON_CLIENT_ALLOCATOR=platform LD_PRELOAD=build/cuda_swap.so python tests/alloc_oom_jax.py
 ```
 
+**`tests/multi_stream.py`** — Allocates large weight matrices across 4 independent CUDA streams whose combined size exceeds VRAM (1.5× total). All streams run concurrently; cuda_swap spills some weights to host RAM while the GPU computes on the rest. Verifies all outputs are numerically correct.
+```bash
+LD_PRELOAD=build/cuda_swap.so python tests/multi_stream.py
+```
+
 ## Results
 
 Benchmarked on RTX 3070 Ti (8 GB VRAM, 16 GB RAM), 3 trials each, run in a Docker container with a 10 GB RAM cap.
