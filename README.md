@@ -4,7 +4,9 @@
 
 ## How it works
 
-Intercepts `cudaMalloc`/`cuMemAlloc`. While VRAM is above the threshold, allocations use regular device memory. When VRAM runs low, it switches to `cuMemAllocManaged` — CUDA unified memory — which the driver automatically pages between GPU and RAM via hardware page faults.
+Intercepts `cudaMalloc`/`cuMemAlloc`. Allocations use regular device memory (`cuMemAlloc`) whenever VRAM can hold them — pages go straight to VRAM, no host RAM cost, no page fault overhead. When VRAM is genuinely too full to fit a new allocation, it falls back to `cuMemAllocManaged` — CUDA unified memory — which the driver automatically pages between GPU and RAM via hardware page faults.
+
+The threshold controls when to start checking host RAM headroom and preferring managed paths, but `cuMemAlloc` is always tried first if VRAM has room. This keeps system RAM usage bounded to the true overflow (workload size minus VRAM capacity) rather than the full allocation.
 
 ## Build
 
@@ -24,7 +26,7 @@ LD_PRELOAD=/path/to/cuda_swap.so python train.py
 
 | Variable | Default | Description |
 |---|---|---|
-| `CUDA_SWAP_THRESHOLD_MB` | `512` | Free VRAM floor (MB). Below this, new allocations use unified memory. |
+| `CUDA_SWAP_THRESHOLD_MB` | `512` | Free VRAM floor (MB). Below this, the host RAM check runs and managed memory is preferred for allocations that don't fit in VRAM. |
 | `CUDA_SWAP_MAX_HOST_MB` | auto | Cap on host RAM used as overflow. Defaults to available RAM minus 1 GB. |
 | `CUDA_SWAP_LOG` | `1` | Verbosity: `0`=off, `1`=warn, `2`=info, `3`=debug. |
 

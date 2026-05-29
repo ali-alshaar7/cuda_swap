@@ -133,6 +133,13 @@ CUresult vmm_alloc(CUdeviceptr* out, size_t size) {
             CS_INFO("cuMemAlloc failed (rc=%d), falling back to managed", rc);
             use_managed = true;
         }
+    } else if (free_vram() >= size) {
+        // Threshold says managed, but VRAM can still fit this allocation.
+        // Prefer cuMemAlloc to avoid system RAM pressure from managed page
+        // placement; only use managed if VRAM actually rejects the allocation.
+        rc = real_cuMemAlloc(out, size);
+        if (rc == CUDA_SUCCESS)
+            use_managed = false;
     }
 
     if (use_managed) {
@@ -147,6 +154,11 @@ CUresult vmm_alloc(CUdeviceptr* out, size_t size) {
             real_cuCtxGetDevice(&dev);
             real_cuMemAdvise(*out, size, CU_MEM_ADVISE_SET_PREFERRED_LOCATION, dev);
             real_cuMemAdvise(*out, size, CU_MEM_ADVISE_SET_ACCESSED_BY, dev);
+            // Proactively migrate pages to VRAM while there's still room, so they
+            // don't sit in system RAM while async GPU kernels are queued. Skip if
+            // VRAM is already too tight — prefetching there would just cause thrash.
+            if (real_cuMemPrefetchAsync && free_vram() > size)
+                real_cuMemPrefetchAsync(*out, size, (int)dev, 0);
         }
         CS_INFO("managed alloc  %zu MB  free_vram=%zu MB",
                 size/(1024*1024), free_vram()/(1024*1024));

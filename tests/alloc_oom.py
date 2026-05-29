@@ -6,7 +6,6 @@ Without cuda_swap: dies with CUDA out of memory.
 With cuda_swap preloaded: completes successfully (slowly, due to host swapping).
 """
 
-import os
 import sys
 import torch
 from utils import available_ram, MemoryMonitor
@@ -23,10 +22,9 @@ def main():
     print(f"Device: {props.name}")
     print(f"Total VRAM: {total_vram / 1024**3:.2f} GB")
 
-    threshold  = int(os.environ.get("CUDA_SWAP_THRESHOLD_MB", 512)) * 1024 * 1024
     host_avail = available_ram()
     max_spill  = max(0, host_avail - 2 * 1024**3)
-    target     = min(int(total_vram * 2.0), (total_vram - threshold) + max_spill)
+    target     = min(int(total_vram * 2.0), total_vram + max_spill)
 
     tensor_bytes = max(total_vram // 8, 256 * 1024 * 1024)
     n        = max(1, (target + tensor_bytes - 1) // tensor_bytes)
